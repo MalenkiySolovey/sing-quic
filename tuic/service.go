@@ -15,7 +15,6 @@ import (
 	qtls "github.com/sagernet/sing-quic"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -339,7 +338,7 @@ func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
 		destination: destination,
 	}
 	if !buffer.IsEmpty() {
-		conn = bufio.NewCachedConn(conn, buffer.ToOwned())
+		conn = &earlyDataConn{Conn: conn, initial: append([]byte(nil), buffer.Bytes()...)}
 	}
 	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, s.authUser), conn, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
 	return nil
