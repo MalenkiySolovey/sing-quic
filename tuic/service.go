@@ -13,10 +13,8 @@ import (
 
 	"github.com/sagernet/quic-go"
 	qtls "github.com/sagernet/sing-quic"
-	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -57,7 +55,7 @@ type Service[U comparable] struct {
 	udpTimeout        time.Duration
 	handler           ServiceHandler
 
-	quicListener io.Closer
+	parents *qtls.ParentOwner[U]
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
@@ -94,6 +92,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		authTimeout:       options.AuthTimeout,
 		udpTimeout:        options.UDPTimeout,
 		handler:           options.Handler,
+		parents:           qtls.NewParentOwner[U](options.Context),
 	}, nil
 }
 
@@ -109,61 +108,36 @@ func (s *Service[U]) UpdateUsers(userList []U, uuidList [][16]byte, passwordList
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
+	var listener qtls.Listener
+	var err error
 	if !s.quicConfig.Allow0RTT {
-		listener, err := qtls.Listen(conn, s.tlsConfig, s.quicConfig)
-		if err != nil {
-			return err
-		}
-		s.quicListener = listener
-		go func() {
-			for {
-				connection, hErr := listener.Accept(s.ctx)
-				if hErr != nil {
-					if E.IsClosedOrCanceled(hErr) || errors.Is(hErr, quic.ErrServerClosed) {
-						s.logger.Debug(E.Cause(hErr, "listener closed"))
-					} else {
-						s.logger.Error(E.Cause(hErr, "listener closed"))
-					}
-					return
-				}
-				go s.handleConnection(connection)
-			}
-		}()
+		listener, err = qtls.Listen(conn, s.tlsConfig, s.quicConfig)
 	} else {
-		listener, err := qtls.ListenEarly(conn, s.tlsConfig, s.quicConfig)
-		if err != nil {
-			return err
-		}
-		s.quicListener = listener
-		go func() {
-			for {
-				connection, hErr := listener.Accept(s.ctx)
-				if hErr != nil {
-					if E.IsClosedOrCanceled(hErr) || errors.Is(hErr, quic.ErrServerClosed) {
-						s.logger.Debug(E.Cause(hErr, "listener closed"))
-					} else {
-						s.logger.Error(E.Cause(hErr, "listener closed"))
-					}
-					return
-				}
-				go s.handleConnection(connection)
-			}
-		}()
+		listener, err = qtls.ListenEarly(conn, s.tlsConfig, s.quicConfig)
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	return s.parents.Start(listener, s.handleConnection, s.listenerError)
 }
 
 func (s *Service[U]) Close() error {
-	return common.Close(
-		s.quicListener,
-	)
+	return s.parents.Close()
 }
 
-func (s *Service[U]) handleConnection(connection *quic.Conn) {
+func (s *Service[U]) listenerError(err error) {
+	if E.IsClosedOrCanceled(err) || errors.Is(err, quic.ErrServerClosed) {
+		s.logger.Debug(E.Cause(err, "listener closed"))
+	} else {
+		s.logger.Error(E.Cause(err, "listener closed"))
+	}
+}
+
+func (s *Service[U]) handleConnection(ctx context.Context, connection *quic.Conn) {
 	setCongestion(s.ctx, connection, s.congestionControl)
 	session := &serverSession[U]{
 		Service:    s,
-		ctx:        s.ctx,
+		ctx:        ctx,
 		quicConn:   connection,
 		connDone:   make(chan struct{}),
 		authDone:   make(chan struct{}),
@@ -210,7 +184,7 @@ func (s *serverSession[U]) loopUniStreams() {
 			return
 		}
 		go func() {
-			err = s.handleUniStream(uniStream)
+			err := s.handleUniStream(uniStream)
 			if err != nil {
 				s.closeWithError(E.Cause(err, "handle uni stream"))
 			}
@@ -259,6 +233,9 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 		case <-s.authDone:
 			return E.New("authentication: multiple authentication requests")
 		default:
+		}
+		if !s.parents.Authenticate(s.quicConn, user) {
+			return E.New("parent retired during authentication")
 		}
 		s.authUser = user
 		close(s.authDone)
@@ -322,7 +299,7 @@ func (s *serverSession[U]) loopStreams() {
 			return
 		}
 		go func() {
-			err = s.handleStream(stream)
+			err := s.handleStream(stream)
 			if err != nil {
 				stream.CancelRead(0)
 				stream.Close()
@@ -361,7 +338,7 @@ func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
 		destination: destination,
 	}
 	if !buffer.IsEmpty() {
-		conn = bufio.NewCachedConn(conn, buffer.ToOwned())
+		conn = &earlyDataConn{Conn: conn, initial: append([]byte(nil), buffer.Bytes()...)}
 	}
 	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, s.authUser), conn, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
 	return nil
