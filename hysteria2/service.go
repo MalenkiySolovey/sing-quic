@@ -3,7 +3,6 @@ package hysteria2
 import (
 	"context"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -73,7 +72,7 @@ type Service[U comparable] struct {
 	udpTimeout            time.Duration
 	handler               ServerHandler
 	masqueradeHandler     http.Handler
-	quicListener          io.Closer
+	parents               *qtls.ParentOwner[U]
 	bbrProfile            congestion_meta2.Profile
 	realmServer           *realm.Server
 }
@@ -145,6 +144,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		masqueradeHandler:     options.MasqueradeHandler,
 		bbrProfile:            bbrProfile,
 		realmServer:           realmServer,
+		parents:               qtls.NewParentOwner[U](options.Context),
 	}, nil
 }
 
@@ -177,9 +177,7 @@ func (s *Service[U]) Start(conn net.PacketConn) error {
 	if err != nil {
 		return err
 	}
-	s.quicListener = listener
-	go s.loopConnections(listener)
-	return nil
+	return s.parents.Start(listener, s.handleConnection, s.listenerError)
 }
 
 func (s *Service[U]) startWithRealm(conn net.PacketConn) error {
@@ -205,17 +203,16 @@ func (s *Service[U]) startWithRealm(conn net.PacketConn) error {
 	if err != nil {
 		return E.Errors(err, s.realmServer.Close())
 	}
-	s.quicListener = listener
-	go s.loopConnections(listener)
-	return nil
+	return s.parents.Start(listener, s.handleConnection, s.listenerError)
 }
 
 func (s *Service[U]) Close() error {
+	parentErr := s.parents.Close()
 	var realmErr error
 	if s.realmServer != nil {
 		realmErr = s.realmServer.Close()
 	}
-	return E.Errors(realmErr, common.Close(s.quicListener))
+	return E.Errors(parentErr, realmErr)
 }
 
 func (s *Service[U]) Reset() {
@@ -224,25 +221,18 @@ func (s *Service[U]) Reset() {
 	}
 }
 
-func (s *Service[U]) loopConnections(listener qtls.Listener) {
-	for {
-		connection, err := listener.Accept(s.ctx)
-		if err != nil {
-			if E.IsClosedOrCanceled(err) || errors.Is(err, quic.ErrServerClosed) {
-				s.logger.Debug(E.Cause(err, "listener closed"))
-			} else {
-				s.logger.Error(E.Cause(err, "listener closed"))
-			}
-			return
-		}
-		go s.handleConnection(connection)
+func (s *Service[U]) listenerError(err error) {
+	if E.IsClosedOrCanceled(err) || errors.Is(err, quic.ErrServerClosed) {
+		s.logger.Debug(E.Cause(err, "listener closed"))
+	} else {
+		s.logger.Error(E.Cause(err, "listener closed"))
 	}
 }
 
-func (s *Service[U]) handleConnection(connection *quic.Conn) {
+func (s *Service[U]) handleConnection(ctx context.Context, connection *quic.Conn) {
 	session := &serverSession[U]{
 		Service:    s,
-		ctx:        s.ctx,
+		ctx:        ctx,
 		quicConn:   connection,
 		connDone:   make(chan struct{}),
 		udpConnMap: make(map[uint32]*udpPacketConn),
@@ -263,6 +253,7 @@ type serverSession[U comparable] struct {
 	connDone      chan struct{}
 	connErr       error
 	authenticated bool
+	authAccess    sync.RWMutex
 	authUser      U
 	udpAccess     sync.RWMutex
 	udpConnMap    map[uint32]*udpPacketConn
@@ -270,6 +261,8 @@ type serverSession[U comparable] struct {
 
 func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && r.Host == protocol.URLHost && r.URL.Path == protocol.URLPath {
+		s.authAccess.Lock()
+		defer s.authAccess.Unlock()
 		if s.authenticated {
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 				UDPEnabled: !s.udpDisabled,
@@ -283,6 +276,10 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		user, loaded := s.userMap[request.Auth]
 		if !loaded {
 			s.masqueradeHandler.ServeHTTP(w, r)
+			return
+		}
+		if !s.parents.Authenticate(s.quicConn, user) {
+			s.closeWithError(E.New("parent retired during authentication"))
 			return
 		}
 		s.authUser = user
@@ -329,7 +326,10 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *serverSession[U]) dispatchStream(frameType http3.FrameType, stream *quic.Stream, err error) (bool, error) {
-	if !s.authenticated || err != nil {
+	s.authAccess.RLock()
+	authenticated := s.authenticated
+	s.authAccess.RUnlock()
+	if !authenticated || err != nil {
 		return false, nil
 	}
 	if frameType != protocol.FrameTypeTCPRequest {
