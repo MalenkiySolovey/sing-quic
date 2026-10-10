@@ -3,7 +3,6 @@ package hysteria
 import (
 	"context"
 	"errors"
-	"io"
 	"net"
 	"os"
 	"runtime"
@@ -13,7 +12,6 @@ import (
 	"github.com/sagernet/quic-go"
 	qtls "github.com/sagernet/sing-quic"
 	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
-	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/canceler"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -55,7 +53,7 @@ type Service[U comparable] struct {
 	udpDisabled   bool
 	udpTimeout    time.Duration
 	handler       ServerHandler
-	quicListener  io.Closer
+	parents       *qtls.ParentOwner[U]
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
@@ -94,6 +92,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		handler:       options.Handler,
 		udpDisabled:   options.UDPDisabled,
 		udpTimeout:    options.UDPTimeout,
+		parents:       qtls.NewParentOwner[U](options.Context),
 	}, nil
 }
 
@@ -113,37 +112,25 @@ func (s *Service[U]) Start(conn net.PacketConn) error {
 	if err != nil {
 		return err
 	}
-	s.quicListener = listener
-	go s.loopConnections(listener)
-	return nil
+	return s.parents.Start(listener, s.handleConnection, s.listenerError)
 }
 
 func (s *Service[U]) Close() error {
-	return common.Close(
-		s.quicListener,
-	)
+	return s.parents.Close()
 }
 
-func (s *Service[U]) loopConnections(listener qtls.Listener) {
-	for {
-		connection, err := listener.Accept(s.ctx)
-		if err != nil {
-			if E.IsClosedOrCanceled(err) || errors.Is(err, quic.ErrServerClosed) {
-				s.logger.Debug(E.Cause(err, "listener closed"))
-			} else {
-				s.logger.Error(E.Cause(err, "listener closed"))
-			}
-			return
-		}
-		session := &serverSession[U]{
-			Service:    s,
-			ctx:        s.ctx,
-			quicConn:   connection,
-			connDone:   make(chan struct{}),
-			udpConnMap: make(map[uint32]*udpPacketConn),
-		}
-		go session.handleConnection()
+func (s *Service[U]) listenerError(err error) {
+	if E.IsClosedOrCanceled(err) || errors.Is(err, quic.ErrServerClosed) {
+		s.logger.Debug(E.Cause(err, "listener closed"))
+	} else {
+		s.logger.Error(E.Cause(err, "listener closed"))
 	}
+}
+
+func (s *Service[U]) handleConnection(ctx context.Context, connection *quic.Conn) {
+	session := &serverSession[U]{Service: s, ctx: ctx, quicConn: connection,
+		connDone: make(chan struct{}), udpConnMap: make(map[uint32]*udpPacketConn)}
+	session.handleConnection()
 }
 
 type serverSession[U comparable] struct {
@@ -179,7 +166,11 @@ func (s *serverSession[U]) handleConnection() {
 			OK:      false,
 			Message: "Wrong password",
 		})
-		s.closeWithError0(ErrorCodeAuthError, E.New("authentication failed, auth_str=", clientHello.Auth))
+		s.closeWithError0(ErrorCodeAuthError, E.New("authentication failed"))
+		return
+	}
+	if !s.parents.Authenticate(s.quicConn, user) {
+		s.closeWithError(E.New("parent retired during authentication"))
 		return
 	}
 	err = WriteServerHello(controlStream, ServerHello{
@@ -207,7 +198,7 @@ func (s *serverSession[U]) loopStreams() {
 			return
 		}
 		go func() {
-			err = s.handleStream(stream)
+			err := s.handleStream(stream)
 			if err != nil {
 				stream.CancelRead(0)
 				stream.Close()
