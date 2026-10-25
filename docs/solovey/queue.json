@@ -1,0 +1,30 @@
+{
+  "schema": "solovey.core-patch-queue/v1",
+  "sourceAuthority": "https://github.com/SagerNet/sing-quic",
+  "copyRepository": "https://github.com/MalenkiySolovey/sing-quic",
+  "copyRole": "mirror/cache/development",
+  "base": "6a3a24d65b99587fad1d4cdd567c88f212acdd63",
+  "upstreamTree": "4a71776d8bf93353aff895137c852a6cbf127b7f",
+  "pristineRef": "refs/heads/mirror/official-6a3a24d",
+  "patchBranch": "solovey/official-patches",
+  "codeTree": "66be202475c03b17f6aa22c67df4653c7662d802",
+  "patchIds": [
+    "OFFICIAL-QUIC-0001"
+  ],
+  "legacyAcceptedCommits": {
+    "b2eea8ca8762dd1e438171e2f7b56f9715c30cbb": "OFFICIAL-QUIC-0001"
+  },
+  "metadataPaths": [
+    ".github/workflows/solovey-patch-queue.yml",
+    "scripts/verify-solovey-queue.py",
+    "docs/solovey/queue.json",
+    "docs/solovey/SING_QUIC_OFFICIAL_BASELINE.md",
+    "docs/solovey/UPSTREAM_REBASE_PROCEDURE.md"
+  ],
+  "regressionPackages": [
+    "./..."
+  ],
+  "buildTags": "",
+  "localPatchesClassification": "ENGINE_PATCH_REQUIRED",
+  "upstreamContributionStatus": "CANDIDATES_PREPARED_NOT_SUBMITTED"
+}
